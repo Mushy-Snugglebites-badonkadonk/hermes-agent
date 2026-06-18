@@ -11,9 +11,14 @@ downloading from PR #4588 (YuhangLin).
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
+import shutil
+import tempfile
+import time
 import uuid
+import wave
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -71,6 +76,9 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_INBOUND_DEDUPE_SIZE = 1000  # LRU cap for BlueBubbles webhook duplicate keys
+_INBOUND_GUID_DEDUPE_SECONDS = 600.0
+_INBOUND_FINGERPRINT_DEDUPE_SECONDS = 3.0
 
 
 def _redact(text: str) -> str:
@@ -150,6 +158,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._inbound_dedupe: OrderedDict[str, float] = OrderedDict()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -553,6 +562,142 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Media sending (outbound)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _guess_attachment_mime(file_path: str, is_audio_message: bool = False) -> str:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".caf":
+            return "audio/x-caf"
+        if ext == ".m4a":
+            return "audio/mp4"
+        if ext == ".mp3":
+            return "audio/mpeg"
+        if ext == ".wav":
+            return "audio/wav"
+        if ext in {".ogg", ".opus"}:
+            return "audio/ogg"
+        guessed, _ = mimetypes.guess_type(file_path)
+        if guessed:
+            return guessed
+        return "audio/x-caf" if is_audio_message else "application/octet-stream"
+
+    @staticmethod
+    def _find_ffmpeg_binary() -> Optional[str]:
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return shutil.which("ffmpeg")
+
+    @staticmethod
+    def _find_afconvert_binary() -> Optional[str]:
+        for candidate in ("/usr/bin/afconvert", "/bin/afconvert"):
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return shutil.which("afconvert")
+
+    @staticmethod
+    def _is_native_voice_wav_source(audio_path: str) -> bool:
+        if os.path.splitext(audio_path)[1].lower() != ".wav":
+            return False
+        try:
+            with wave.open(audio_path, "rb") as wf:
+                return wf.getnchannels() == 1 and wf.getframerate() == 24000
+        except (OSError, wave.Error, EOFError):
+            return False
+
+    async def _prepare_voice_upload(self, audio_path: str) -> tuple[str, Optional[str]]:
+        """Return the outbound path and optional cleanup path."""
+        if os.path.splitext(audio_path)[1].lower() == ".caf":
+            return audio_path, None
+
+        afconvert = self._find_afconvert_binary()
+        if not afconvert:
+            logger.warning("[bluebubbles] afconvert not found; using original audio path")
+            return audio_path, None
+
+        if self._is_native_voice_wav_source(audio_path):
+            normalized_path = audio_path
+            normalize_cleanup: Optional[str] = None
+        else:
+            ffmpeg = self._find_ffmpeg_binary()
+            if not ffmpeg:
+                logger.warning("[bluebubbles] ffmpeg not found; skipping WAV normalization")
+                normalized_path = audio_path
+                normalize_cleanup = None
+            else:
+                fd, normalized_path = tempfile.mkstemp(
+                    prefix="hermes-bb-voice-src-", suffix=".wav"
+                )
+                os.close(fd)
+                norm_proc = await asyncio.create_subprocess_exec(
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    normalized_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, norm_stderr = await norm_proc.communicate()
+                if (
+                    norm_proc.returncode != 0
+                    or not os.path.exists(normalized_path)
+                    or os.path.getsize(normalized_path) == 0
+                ):
+                    try:
+                        os.unlink(normalized_path)
+                    except OSError:
+                        pass
+                    logger.warning(
+                        "[bluebubbles] voice normalization failed for %s: %s",
+                        os.path.basename(audio_path),
+                        norm_stderr.decode(errors="replace").strip()
+                        or f"exit {norm_proc.returncode}",
+                    )
+                    return audio_path, None
+                normalize_cleanup = normalized_path
+
+        fd, caf_path = tempfile.mkstemp(prefix="hermes-bb-voice-", suffix=".caf")
+        os.close(fd)
+        proc = await asyncio.create_subprocess_exec(
+            afconvert,
+            "-f",
+            "caff",
+            "-d",
+            "opus@24000",
+            "-c",
+            "1",
+            normalized_path,
+            caf_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if normalize_cleanup:
+            try:
+                os.unlink(normalize_cleanup)
+            except OSError:
+                pass
+
+        if proc.returncode != 0 or not os.path.exists(caf_path) or os.path.getsize(caf_path) == 0:
+            try:
+                os.unlink(caf_path)
+            except OSError:
+                pass
+            logger.warning(
+                "[bluebubbles] Opus CAF conversion failed for %s: %s",
+                os.path.basename(audio_path),
+                stderr.decode(errors="replace").strip() or f"exit {proc.returncode}",
+            )
+            return audio_path, None
+        return caf_path, caf_path
+
     async def _send_attachment(
         self,
         chat_id: str,
@@ -571,10 +716,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not guid:
             return SendResult(success=False, error=f"Chat not found: {chat_id}")
 
-        fname = filename or os.path.basename(file_path)
+        upload_path = file_path
+        cleanup_path: Optional[str] = None
+        if is_audio_message:
+            upload_path, cleanup_path = await self._prepare_voice_upload(file_path)
+
+        fname = filename or os.path.basename(upload_path)
+        mime_type = self._guess_attachment_mime(upload_path, is_audio_message=is_audio_message)
         try:
-            with open(file_path, "rb") as f:
-                files = {"attachment": (fname, f, "application/octet-stream")}
+            with open(upload_path, "rb") as f:
+                files = {"attachment": (fname, f, mime_type)}
                 data: Dict[str, str] = {
                     "chatGuid": guid,
                     "name": fname,
@@ -582,6 +733,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 }
                 if is_audio_message:
                     data["isAudioMessage"] = "true"
+                    if self._private_api_enabled and self._helper_connected:
+                        data["method"] = "private-api"
                 res = await self.client.post(
                     self._api_url("/api/v1/message/attachment"),
                     files=files,
@@ -590,7 +743,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
                 res.raise_for_status()
                 result = res.json()
-
             if caption:
                 await self.send(chat_id, caption)
 
@@ -606,6 +758,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        finally:
+            if cleanup_path:
+                try:
+                    os.unlink(cleanup_path)
+                except OSError:
+                    pass
 
     async def send_image(
         self,
@@ -860,6 +1018,51 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    @staticmethod
+    def _attachment_fingerprint(attachments: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for att in attachments or []:
+            if not isinstance(att, dict):
+                continue
+            parts.append(
+                str(
+                    att.get("guid")
+                    or att.get("originalGuid")
+                    or att.get("transferName")
+                    or att.get("mimeType")
+                    or ""
+                )
+            )
+        return ",".join(parts)
+
+    def _inbound_seen_recently(self, key: str, ttl_seconds: float) -> bool:
+        """Return True once for duplicated BlueBubbles webhook deliveries.
+
+        BlueBubbles can emit the same iMessage under both a raw chat GUID such
+        as ``any;-;<handle>`` and the handle itself.  Gateway session keys treat
+        those as separate chats, so the platform adapter must dedupe before
+        spawning the agent loop.
+        """
+        if not key:
+            return False
+        now = time.monotonic()
+        # Prune expired entries and enforce an LRU cap opportunistically.
+        for old_key, seen_at in list(self._inbound_dedupe.items()):
+            if now - seen_at > _INBOUND_GUID_DEDUPE_SECONDS:
+                self._inbound_dedupe.pop(old_key, None)
+            else:
+                break
+        while len(self._inbound_dedupe) > _INBOUND_DEDUPE_SIZE:
+            self._inbound_dedupe.popitem(last=False)
+
+        seen_at = self._inbound_dedupe.get(key)
+        if seen_at is not None and now - seen_at <= ttl_seconds:
+            self._inbound_dedupe.move_to_end(key)
+            return True
+        self._inbound_dedupe[key] = now
+        self._inbound_dedupe.move_to_end(key)
+        return False
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -993,6 +1196,32 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
 
+        message_id = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+        if message_id:
+            dedupe_key = f"guid:{message_id}"
+            dedupe_ttl = _INBOUND_GUID_DEDUPE_SECONDS
+        else:
+            # Fallback for BlueBubbles payload variants that omit message GUIDs.
+            # Deliberately excludes chat_guid/chat_identifier so the same human
+            # message delivered once as ``any;-;<handle>`` and once as ``<handle>``
+            # is still treated as one inbound event.
+            dedupe_key = "fp:%s|%s|%s" % (
+                sender,
+                text,
+                self._attachment_fingerprint(attachments),
+            )
+            dedupe_ttl = _INBOUND_FINGERPRINT_DEDUPE_SECONDS
+        if self._inbound_seen_recently(dedupe_key, dedupe_ttl):
+            logger.info(
+                "[bluebubbles] duplicate inbound event ignored for message %s",
+                _redact(message_id or dedupe_key),
+            )
+            return web.Response(text="ok")
+
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         if is_group and self.require_mention:
@@ -1015,11 +1244,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=payload,
-            message_id=self._value(
-                record.get("guid"),
-                record.get("messageGuid"),
-                record.get("id"),
-            ),
+            message_id=message_id,
             reply_to_message_id=self._value(
                 record.get("threadOriginatorGuid"),
                 record.get("associatedMessageGuid"),

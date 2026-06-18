@@ -15,8 +15,10 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+import wave
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
@@ -2778,6 +2780,160 @@ class BasePlatformAdapter(ABC):
         """
         return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
 
+    def prepare_auto_tts_text(self, text: str) -> str:
+        """Prepare auto-TTS text without legacy output clipping.
+
+        ``prepare_tts_text`` keeps its 4000-char cap for backward compatibility.
+        The auto-TTS voice-reply path prefers full-response synthesis and handles
+        provider caps by chunking when needed.
+        """
+        return re.sub(r'[*_`#\[\]()]', '', text).strip()
+
+    def _auto_tts_output_suffix(self) -> str:
+        """Return preferred temporary output extension for auto-TTS."""
+        return ".wav" if self.platform == Platform.BLUEBUBBLES else ".mp3"
+
+    @staticmethod
+    def _split_tts_text(text: str, limit: int) -> List[str]:
+        """Split text into provider-safe chunks on sentence / paragraph boundaries."""
+        if len(text) <= limit:
+            return [text]
+        chunks: List[str] = []
+        remaining = text.strip()
+        boundary_re = re.compile(r"(?<=[.!?。！？])\s+|\n{2,}")
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            window = remaining[:limit]
+            split_at = -1
+            for match in boundary_re.finditer(window):
+                split_at = match.end()
+            if split_at < max(200, int(limit * 0.45)):
+                split_at = max(window.rfind("\n"), window.rfind(" "))
+            if split_at < max(200, int(limit * 0.45)):
+                split_at = limit
+            chunk = remaining[:split_at].strip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[split_at:].strip()
+        return chunks
+
+    @staticmethod
+    def _concat_wav_files(parts: List[str], output_path: str) -> bool:
+        """Concatenate WAV parts without re-encoding when formats match."""
+        if not parts:
+            return False
+        params = None
+        expected = None
+        frames: List[bytes] = []
+        try:
+            for part in parts:
+                with wave.open(part, "rb") as wf:
+                    part_params = wf.getparams()
+                    comparable = (
+                        part_params.nchannels,
+                        part_params.sampwidth,
+                        part_params.framerate,
+                        part_params.comptype,
+                        part_params.compname,
+                    )
+                    if params is None:
+                        params = part_params
+                        expected = comparable
+                    elif comparable != expected:
+                        return False
+                    frames.append(wf.readframes(wf.getnframes()))
+            if params is None:
+                return False
+            with wave.open(output_path, "wb") as out:
+                out.setparams(params)
+                for data in frames:
+                    out.writeframes(data)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        except (OSError, wave.Error, EOFError):
+            return False
+
+    async def _synthesize_auto_tts_audio(self, text: str) -> Optional[str]:
+        """Synthesize full auto-response audio and return a playable file path.
+
+        Supports provider-safe chunking; when the output artifact is WAV, chunks are
+        concatenated so full text is preserved instead of silently truncating.
+        """
+        from tools.tts_tool import text_to_speech_tool, _load_tts_config, _get_provider, _resolve_max_text_length
+
+        tts_config = _load_tts_config()
+        provider = _get_provider(tts_config)
+        max_len = max(1, _resolve_max_text_length(provider, tts_config))
+        chunks = self._split_tts_text(text, max_len)
+        suffix = self._auto_tts_output_suffix()
+        out_dir = os.path.join(tempfile.gettempdir(), "hermes_voice")
+        os.makedirs(out_dir, exist_ok=True)
+
+        if len(chunks) == 1:
+            output_path = os.path.join(out_dir, f"auto_tts_{uuid.uuid4().hex[:12]}{suffix}")
+            result_str = await asyncio.to_thread(
+                text_to_speech_tool, text=chunks[0], output_path=output_path
+            )
+            import json as _json
+
+            data = _json.loads(result_str)
+            path = data.get("file_path")
+            return path if data.get("success") and path and os.path.exists(path) else None
+
+        if suffix != ".wav":
+            # Non-WAV backends keep their single-request behavior; provider
+            # clipping is unavoidable unless re-encoding is added.
+            logger.warning(
+                "[%s] Auto-TTS response is %d chars split into %d chunks, but %s concat is unsupported; using first chunk",
+                self.name,
+                len(text),
+                len(chunks),
+                suffix,
+            )
+            output_path = os.path.join(out_dir, f"auto_tts_{uuid.uuid4().hex[:12]}{suffix}")
+            result_str = await asyncio.to_thread(
+                text_to_speech_tool, text=chunks[0], output_path=output_path
+            )
+            import json as _json
+
+            data = _json.loads(result_str)
+            path = data.get("file_path")
+            return path if data.get("success") and path and os.path.exists(path) else None
+
+        import json as _json
+        part_paths: List[str] = []
+        try:
+            for idx, chunk in enumerate(chunks, start=1):
+                part_path = os.path.join(
+                    out_dir, f"auto_tts_{uuid.uuid4().hex[:12]}_{idx}.wav"
+                )
+                result_str = await asyncio.to_thread(
+                    text_to_speech_tool, text=chunk, output_path=part_path
+                )
+                data = _json.loads(result_str)
+                path = data.get("file_path")
+                if not data.get("success") or not path or not os.path.exists(path):
+                    raise RuntimeError(data.get("error") or f"chunk {idx} tts failed")
+                part_paths.append(path)
+
+            final_path = os.path.join(out_dir, f"auto_tts_{uuid.uuid4().hex[:12]}.wav")
+            if self._concat_wav_files(part_paths, final_path):
+                logger.info(
+                    "[%s] Auto-TTS synthesized %d chunks into one WAV (%d chars)",
+                    self.name,
+                    len(part_paths),
+                    len(text),
+                )
+                return final_path
+            raise RuntimeError("WAV chunk concat failed")
+        finally:
+            for p in part_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
     async def play_tts(
         self,
         chat_id: str,
@@ -4291,20 +4447,19 @@ class BasePlatformAdapter(ABC):
                         and text_content
                         and not media_files):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        from tools.tts_tool import check_tts_requirements
                         if check_tts_requirements():
-                            import json as _json
-                            speech_text = self.prepare_tts_text(text_content)
+                            speech_text = self.prepare_auto_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
-                            )
-                            tts_data = _json.loads(tts_result_str)
-                            _tts_path = tts_data.get("file_path")
+                            _tts_path = await self._synthesize_auto_tts_audio(speech_text)
+                            if _tts_path is None:
+                                logger.warning(
+                                    "[%s] Auto-TTS provider returned no playable audio",
+                                    self.name,
+                                )
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
-
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
                 if _tts_path and Path(_tts_path).exists():

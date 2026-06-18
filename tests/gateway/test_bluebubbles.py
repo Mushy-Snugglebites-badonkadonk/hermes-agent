@@ -108,6 +108,37 @@ class TestBlueBubblesHelpers:
         adapter = _make_adapter(monkeypatch)
         assert adapter.format_message("**Hello** `world`") == "Hello world"
 
+    def test_inbound_dedupe_suppresses_duplicate_guid(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        assert adapter._inbound_seen_recently("guid:message-1", 600.0) is False
+        assert adapter._inbound_seen_recently("guid:message-1", 600.0) is True
+        assert adapter._inbound_seen_recently("guid:message-2", 600.0) is False
+
+    def test_attachment_audio_mime_detection(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        assert adapter._guess_attachment_mime("voice.caf", is_audio_message=True) == "audio/x-caf"
+        assert adapter._guess_attachment_mime("voice.m4a", is_audio_message=True) == "audio/mp4"
+        assert adapter._guess_attachment_mime("voice.wav", is_audio_message=True) == "audio/wav"
+
+    def test_attachment_fingerprint_uses_stable_attachment_fields(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        fingerprint = adapter._attachment_fingerprint([
+            {"guid": "att-guid", "mimeType": "audio/mp4"},
+            {"transferName": "voice.m4a", "mimeType": "audio/mp4"},
+        ])
+
+        assert fingerprint == "att-guid,voice.m4a"
+
+    def test_prepare_auto_tts_text_preserves_long_response(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        text = "**" + ("a" * 4500) + "**"
+
+        assert len(adapter.prepare_tts_text(text)) == 4000
+        assert len(adapter.prepare_auto_tts_text(text)) == 4500
+
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         text = "Use /api_v2 with FEATURE_FLAG_NAME and config_file.json"

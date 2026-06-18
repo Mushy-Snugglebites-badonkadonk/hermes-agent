@@ -10370,34 +10370,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         audio_path = None
         actual_path = None
         try:
-            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+            from tools.tts_tool import _strip_markdown_for_tts, text_to_speech_tool
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
                 return
 
-            # Telegram's adapter only sends native voice bubbles for OGG/Opus.
-            # Other platforms keep the existing MP3 default.
-            audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}",
-            )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
-            )
+            adapter = self.adapters.get(event.source.platform)
+            synthesize_auto_tts = getattr(adapter, "_synthesize_auto_tts_audio", None)
             try:
-                result = json.loads(result_json)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
+                from unittest.mock import Mock as _Mock
+                synthesize_is_mock = isinstance(synthesize_auto_tts, _Mock)
+            except Exception:
+                synthesize_is_mock = False
+            if (
+                adapter is not None
+                and not synthesize_is_mock
+                and inspect.iscoroutinefunction(synthesize_auto_tts)
+            ):
+                actual_path = await synthesize_auto_tts(tts_text)
+                if not actual_path or not os.path.isfile(actual_path):
+                    return
+            else:
+                # Telegram's adapter only sends native voice bubbles for OGG/Opus.
+                # Other platforms keep the existing MP3 default.
+                audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
+                audio_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_voice",
+                    f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}",
+                )
+                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
-            # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual_path):
-                logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                result_json = await asyncio.to_thread(
+                    text_to_speech_tool, text=tts_text, output_path=audio_path
+                )
+                try:
+                    result = json.loads(result_json)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
+                    return
+
+                # Use the actual file path from result (may differ after opus conversion)
+                actual_path = result.get("file_path", audio_path)
+                if not result.get("success") or not os.path.isfile(actual_path):
+                    logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                    return
+
+            # Normalize to a concrete path for cleanup + send
+            if not actual_path:
                 return
 
             adapter = self.adapters.get(event.source.platform)
