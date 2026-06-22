@@ -53,9 +53,27 @@ MAX_TEXT_LENGTH = 4000
 # `require_mention: true` without custom aliases uses Hermes wake words.
 DEFAULT_MENTION_PATTERNS = [r"(?<![\w@])@?hermes\s+agent\b[,:\-]?", r"(?<![\w@])@?hermes\b[,:\-]?"]
 
-# Tapback associatedMessageType codes: 2000-2005 added, 3000-3005 removed (love, like, dislike, ...).
-_TAPBACK_CODES = {*range(2000, 2006), *range(3000, 3006)}
-_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}  # webhook event types carrying user messages
+# Tapback associatedMessageType codes: 2000-2005 added, 3000-3005 removed.
+_TAPBACK_ADDED = {
+    2000: "love", 2001: "like", 2002: "dislike",
+    2003: "laugh", 2004: "emphasize", 2005: "question",
+}
+_TAPBACK_REMOVED = {
+    3000: "love", 3001: "like", 3002: "dislike",
+    3003: "laugh", 3004: "emphasize", 3005: "question",
+}
+_TAPBACK_TEXT_RE = re.compile(
+    r'^(?P<verb>Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+["“](?P<target>.*)["”]$', re.S,
+)
+_TAPBACK_REMOVED_TEXT_RE = re.compile(
+    r'^Removed an? (?P<reaction>like|love|dislike|laugh|emphasis|question) from\s+["“](?P<target>.*)["”]$', re.S,
+)
+_TAPBACK_VERBS = {
+    "Liked": "liked", "Loved": "loved", "Disliked": "disliked",
+    "Laughed at": "laughed at", "Emphasized": "emphasized", "Questioned": "questioned",
+}
+_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+_UPDATED_MESSAGE_CACHE_LIMIT = 500
 
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -131,6 +149,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._recent_message_texts: OrderedDict[str, str] = OrderedDict()
+        self._recent_update_event_keys: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
 
     # --- API helpers ---
 
@@ -559,6 +579,123 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             chat_identifier = sender
         return chat_guid, chat_identifier, sender
 
+    @staticmethod
+    def _is_set(value: Any) -> bool:
+        return value not in (None, "", 0, False)
+
+    def _message_id_for_record(self, record: Dict[str, Any]) -> Optional[str]:
+        return self._value(record.get("guid"), record.get("messageGuid"),
+                           record.get("message_guid"), record.get("id"))
+
+    def _remember_message_text(self, message_id: Optional[str], text: str) -> None:
+        if not message_id or not text:
+            return
+        self._recent_message_texts[message_id] = text
+        self._recent_message_texts.move_to_end(message_id)
+        while len(self._recent_message_texts) > _UPDATED_MESSAGE_CACHE_LIMIT:
+            self._recent_message_texts.popitem(last=False)
+
+    @staticmethod
+    def _canonical_dm_handle(raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        value = raw.strip()
+        if ";+;" in value:
+            return None
+        if ";-;" in value:
+            value = value.rsplit(";-;", 1)[-1]
+        return value or None
+
+    def _canonical_chat_id(self, chat_guid: Optional[str], chat_identifier: Optional[str],
+                           sender: Optional[str], is_group: bool) -> str:
+        if is_group:
+            return chat_guid or chat_identifier or sender or ""
+        return (self._canonical_dm_handle(chat_identifier)
+                or self._canonical_dm_handle(sender)
+                or self._canonical_dm_handle(chat_guid)
+                or chat_guid or chat_identifier or sender or "")
+
+    @staticmethod
+    def _classify_tapback_text(text: str) -> Optional[str]:
+        stripped = text.strip()
+        removed = _TAPBACK_REMOVED_TEXT_RE.match(stripped)
+        if removed:
+            reaction = removed.group("reaction")
+            target = removed.group("target").strip()
+            return f"Reaction removed: User removed a {reaction} Tapback from: {target}"
+        match = _TAPBACK_TEXT_RE.match(stripped)
+        if not match:
+            return None
+        verb = _TAPBACK_VERBS[match.group("verb")]
+        target = match.group("target").strip()
+        return f"Reaction: User {verb} this message: {target}"
+
+    def _classify_tapback_record(self, record: Dict[str, Any], text: str) -> Optional[str]:
+        assoc_type = record.get("associatedMessageType")
+        if isinstance(assoc_type, str) and assoc_type.strip().lstrip("-").isdigit():
+            assoc_type = int(assoc_type)
+        if isinstance(assoc_type, int):
+            if assoc_type in _TAPBACK_ADDED:
+                reaction = _TAPBACK_ADDED[assoc_type]
+                return f"Reaction: User added a {reaction} Tapback to: {text or '(message text unavailable)'}"
+            if assoc_type in _TAPBACK_REMOVED:
+                reaction = _TAPBACK_REMOVED[assoc_type]
+                return f"Reaction removed: User removed a {reaction} Tapback from: {text or '(message text unavailable)'}"
+        return self._classify_tapback_text(text)
+
+    def _classify_updated_message(self, record: Dict[str, Any], message_id: Optional[str],
+                                  text: str) -> Optional[str]:
+        """Return a user-facing edit/retraction event, or None for update no-ops."""
+        if not message_id:
+            return None
+        previous = self._recent_message_texts.get(message_id)
+        if any(self._is_set(record.get(key)) for key in
+               ("dateRetracted", "date_retracted", "retractedAt", "retracted_at")):
+            return (f"Message retracted/unsent.\nOriginal text: {previous}"
+                    if previous else "Message retracted/unsent.\nOriginal text: (unknown)")
+        if not any(self._is_set(record.get(key)) for key in
+                   ("dateEdited", "date_edited", "editedAt", "edited_at")):
+            return None
+        if not text or previous == text:
+            return None
+        if previous:
+            return f"Message edited.\nBefore: {previous}\nAfter: {text}"
+        return f"Message edited.\nNew text: {text}"
+
+    def _update_event_key(self, event_type: str, record: Dict[str, Any], message_id: Optional[str],
+                          text: str, routing_identity: str, *, is_tapback: bool) -> Optional[tuple[Any, ...]]:
+        if not message_id:
+            return None
+        if is_tapback:
+            return ("tapback", message_id, routing_identity, text)
+        if event_type != "updated-message":
+            return None
+        if any(self._is_set(record.get(key)) for key in
+               ("dateRetracted", "date_retracted", "retractedAt", "retracted_at")):
+            return ("retraction", message_id, routing_identity)
+        if any(self._is_set(record.get(key)) for key in
+               ("dateEdited", "date_edited", "editedAt", "edited_at")):
+            return ("edit", message_id, routing_identity, text)
+        return None
+
+    def _has_seen_update_event(self, key: Optional[tuple[Any, ...]]) -> bool:
+        if key is None:
+            return False
+        identity = key[:3]
+        if self._recent_update_event_keys.get(identity) != key:
+            return False
+        self._recent_update_event_keys.move_to_end(identity)
+        return True
+
+    def _remember_update_event(self, key: Optional[tuple[Any, ...]]) -> None:
+        if key is None:
+            return
+        identity = key[:3]
+        self._recent_update_event_keys[identity] = key
+        self._recent_update_event_keys.move_to_end(identity)
+        while len(self._recent_update_event_keys) > _UPDATED_MESSAGE_CACHE_LIMIT:
+            self._recent_update_event_keys.popitem(last=False)
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -570,41 +707,83 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             logger.error("[bluebubbles] webhook parse error: %s", exc)
             return web.json_response({"error": "invalid payload"}, status=400)
         event_type = self._value(payload.get("type"), payload.get("event")) or ""
-        if event_type and event_type not in _MESSAGE_EVENTS:  # ack non-message events silently
+        if event_type and event_type not in _MESSAGE_EVENTS:
             return _ok()
         record = self._extract_payload_record(payload) or {}
         if record.get("isFromMe") or record.get("fromMe") or record.get("is_from_me"):
             return _ok()
-        assoc_type = record.get("associatedMessageType")
-        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
-            return _ok()
-        text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
+
+        inbound_text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
+        text = inbound_text
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
-        session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
-        # Mention gate BEFORE the attachment downloads: an unmentioned group message must not
-        # pull every attachment through the REST API only to be dropped.
-        if is_group and self.require_mention:
+        session_chat_id = self._canonical_chat_id(chat_guid, chat_identifier, sender, is_group)
+        if not sender or not session_chat_id:
+            return web.json_response({"error": "missing message fields"}, status=400)
+
+        tapback_text = self._classify_tapback_record(record, text)
+        is_tapback = tapback_text is not None
+        message_id = self._message_id_for_record(record)
+        update_event_key = self._update_event_key(
+            event_type, record, message_id, tapback_text or text, session_chat_id, is_tapback=is_tapback)
+        if self._has_seen_update_event(update_event_key):
+            return _ok()
+        if is_tapback:
+            text = tapback_text or text
+
+        is_update_notification = False
+        if event_type == "updated-message" and not is_tapback:
+            text = self._classify_updated_message(record, message_id, inbound_text) or ""
+            if not text:
+                return _ok()
+            is_update_notification = True
+            is_retraction = any(self._is_set(record.get(key)) for key in
+                                ("dateRetracted", "date_retracted", "retractedAt", "retracted_at"))
+            if is_retraction and message_id:
+                self._recent_message_texts.pop(message_id, None)
+            elif not is_retraction:
+                self._remember_message_text(message_id, inbound_text)
+            self._remember_update_event(update_event_key)
+        elif is_tapback:
+            self._remember_update_event(update_event_key)
+        else:
+            self._remember_message_text(message_id, inbound_text)
+
+        # Keep ordinary group-message gating ahead of attachment downloads. Only
+        # classified edits, retractions, and Tapbacks bypass the mention check.
+        if is_group and self.require_mention and not (is_tapback or is_update_notification):
             if not self._message_matches_mention_patterns(text):
                 logger.debug("[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)")
                 return _ok()
             text = self._clean_mention_text(text)
+
         media_urls, media_types, msg_type = await self._collect_attachments(record)
         if not text and media_urls:
             text = "(attachment)"
-        if not sender or not (chat_guid or chat_identifier) or not text:
+        if not text:
             return web.json_response({"error": "missing message fields"}, status=400)
-        source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
-                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
-                                   chat_id_alt=chat_identifier)
+
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name=chat_identifier or sender,
+            chat_type="group" if is_group else "dm",
+            user_id=sender,
+            user_name=sender,
+            chat_id_alt=chat_guid if chat_guid != session_chat_id else chat_identifier,
+        )
         event = MessageEvent(
-            text=text, message_type=msg_type, source=source, raw_message=payload,
-            message_id=self._value(record.get("guid"), record.get("messageGuid"), record.get("id")),
+            text=text,
+            message_type=msg_type,
+            source=source,
+            raw_message=payload,
+            message_id=message_id,
             reply_to_message_id=self._value(record.get("threadOriginatorGuid"), record.get("associatedMessageGuid")),
-            media_urls=media_urls, media_types=media_types)
+            media_urls=media_urls,
+            media_types=media_types,
+        )
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-        if self.send_read_receipts and session_chat_id:  # fire-and-forget read receipt
+        if self.send_read_receipts and session_chat_id:
             asyncio.create_task(self.mark_read(session_chat_id))
         return _ok()
