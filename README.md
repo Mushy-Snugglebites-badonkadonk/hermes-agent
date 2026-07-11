@@ -4,6 +4,8 @@ This fork is a personal playground for Hermes Agent patches, experiments, and sm
 
 Upstream project: https://github.com/NousResearch/hermes-agent
 
+For native Windows installation, use the upstream [PowerShell installer (`scripts/install.ps1`)](https://github.com/NousResearch/hermes-agent/blob/main/scripts/install.ps1).
+
 ## What lives here
 
 - focused bug-fix branches
