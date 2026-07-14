@@ -438,6 +438,63 @@ class TestBusySessionAck:
         assert "Queued for the next turn" not in content
 
     @pytest.mark.asyncio
+    async def test_steer_mode_respects_disabled_transcript_echo(self):
+        """Fast voice steering must honor the existing quiet-STT setting."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner.config.stt_echo_transcripts = False
+        adapter = _make_adapter()
+
+        event = _make_event(text="(The user sent a message with no text content)")
+        event.message_type = MessageType.VOICE
+        event.media_urls = ["/tmp/cached.ogg"]
+        event.media_types = ["audio/ogg"]
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+        runner._enrich_message_with_transcription = AsyncMock(
+            return_value=('"turn left"', ["turn left"])
+        )
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_called_once_with('"turn left"')
+        adapter.send.assert_not_awaited()
+        assert adapter._pending_messages.get(sk) is None
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_queues_all_voice_media_on_partial_transcription_failure(self):
+        """One failed voice attachment must preserve the entire original event."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+
+        event = _make_event(text="")
+        event.message_type = MessageType.VOICE
+        event.media_urls = ["/tmp/first.ogg", "/tmp/second.ogg"]
+        event.media_types = ["audio/ogg", "audio/ogg"]
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+        runner._enrich_message_with_transcription = AsyncMock(
+            return_value=('"first succeeded"\n\n[voice message could not be transcribed]', ["first succeeded"])
+        )
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.steer.assert_not_called()
+        assert adapter._pending_messages.get(sk) is event
+        adapter.send.assert_not_awaited()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+
+    @pytest.mark.asyncio
     async def test_steer_mode_queues_voice_when_transcription_fails(self):
         """Failed voice STT must preserve the original media event for next turn."""
         runner, _sentinel = _make_runner()

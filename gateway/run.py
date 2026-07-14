@@ -5593,14 +5593,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     successful_transcripts = []
                     enriched_text = steer_text
 
-                if successful_transcripts and enriched_text.strip():
+                if (
+                    len(successful_transcripts) == len(voice_paths)
+                    and enriched_text.strip()
+                ):
                     try:
                         steered = bool(running_agent.steer(enriched_text.strip()))
                     except Exception as exc:
                         logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                         steered = False
 
-                    if steered:
+                    if steered and self._should_echo_stt_transcripts():
                         # Match the fresh-message voice path: echo the raw STT
                         # text so the user can verify what was injected.
                         thread_meta = self._thread_metadata_for_source(
