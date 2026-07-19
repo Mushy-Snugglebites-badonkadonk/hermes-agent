@@ -540,21 +540,28 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     async def _collect_attachments(self, record: Dict[str, Any]):
         """Download inbound attachments; returns (media_urls, media_types, msg_type)."""
+        attachments = record.get("attachments") or []
+        if not isinstance(attachments, list):
+            return [], [], MessageType.TEXT
         media_urls: List[str] = []
         media_types: List[str] = []
         msg_type = MessageType.TEXT
-        for att in record.get("attachments") or []:
-            att_guid = att.get("guid", "")
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            att_guid = self._value(att.get("guid"))
             cached = await self._download_attachment(att_guid, att) if att_guid else None
             if not cached:
                 continue
-            mime = (att.get("mimeType") or "").lower()
+            raw_mime = att.get("mimeType")
+            mime = raw_mime.lower() if isinstance(raw_mime, str) else ""
             media_urls.append(cached)
             media_types.append(mime)
-            is_voice = mime.startswith("audio/") or (att.get("uti") or "").endswith("caf")
+            uti = att.get("uti")
+            is_voice = mime.startswith("audio/") or (isinstance(uti, str) and uti.endswith("caf"))
             msg_type = (MessageType.PHOTO if mime.startswith("image/") else MessageType.VOICE if is_voice
                         else MessageType.VIDEO if mime.startswith("video/") else MessageType.DOCUMENT)
-        if len(media_urls) > 1 and any(m.split("/")[0] == "image" for m in media_types):  # any image → PHOTO
+        if len(media_urls) > 1 and any(m.split("/")[0] == "image" for m in media_types):
             msg_type = MessageType.PHOTO
         return media_urls, media_types, msg_type
 
