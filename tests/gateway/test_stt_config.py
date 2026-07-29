@@ -306,31 +306,65 @@ async def test_enrich_message_with_transcription_surfaces_stt_fallback_warning()
     assert "fallback transcript" in result
     assert "STT fallback" not in result
     assert "command exited 127" not in result
-    assert transcripts == [
+    assert transcripts == ["fallback transcript"]
+    assert GatewayRunner._format_stt_echo(transcripts[0]) == (
         '🎙️ "fallback transcript"\n\n'
         "⚠️ STT fallback: parakeet failed, so Hermes used "
         "local / faster-whisper."
-    ]
+    )
 
 
-def test_format_stt_echo_does_not_double_wrap_fallback_notice():
-    from gateway.run import GatewayRunner
+def test_format_stt_echo_includes_fallback_notice_without_changing_raw_text():
+    from gateway.run import GatewayRunner, _STTTranscript
 
+    fallback_transcript = _STTTranscript(
+        "fallback transcript",
+        fallback_from="parakeet",
+        provider_used="local",
+    )
     fallback_notice = (
         '🎙️ "fallback transcript"\n\n'
         "⚠️ STT fallback: parakeet failed, so Hermes used local / faster-whisper."
     )
 
+    assert fallback_transcript == "fallback transcript"
     assert GatewayRunner._format_stt_echo("plain transcript") == '🎙️ "plain transcript"'
-    assert GatewayRunner._format_stt_echo(fallback_notice) == fallback_notice
+    assert GatewayRunner._format_stt_echo(fallback_transcript) == fallback_notice
+
+
+@pytest.mark.asyncio
+async def test_clarify_reply_uses_raw_transcript_after_stt_fallback():
+    from gateway.run import GatewayRunner, _STTTranscript
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._pending_event_audio_paths = lambda event: ["/tmp/voice.ogg"]
+    runner._transcribe_pending_audio_event_once = AsyncMock(
+        return_value=(
+            '"2"',
+            [
+                _STTTranscript(
+                    "2",
+                    fallback_from="parakeet",
+                    provider_used="local",
+                )
+            ],
+        )
+    )
+
+    assert await runner._prepare_clarify_reply_text(object()) == "2"
 
 
 @pytest.mark.asyncio
 async def test_pending_echo_preserves_fallback_notice():
-    from gateway.run import GatewayRunner
+    from gateway.run import GatewayRunner, _STTTranscript
 
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._should_echo_stt_transcripts = lambda: True
+    fallback_transcript = _STTTranscript(
+        "queued fallback",
+        fallback_from="parakeet",
+        provider_used="local",
+    )
     fallback_notice = (
         '🎙️ "queued fallback"\n\n'
         "⚠️ STT fallback: parakeet failed, so Hermes used local / faster-whisper."
@@ -355,7 +389,7 @@ async def test_pending_echo_preserves_fallback_notice():
         event,
         echo_adapter,
         source,
-        [fallback_notice],
+        [fallback_transcript],
         metadata=None,
         log_context="Voice-interrupt",
     )

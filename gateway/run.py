@@ -3337,6 +3337,30 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+class _STTTranscript(str):
+    """Raw transcript text carrying optional user-facing echo metadata.
+
+    The string value deliberately remains the unadorned transcript so consumers
+    such as clarify-choice parsing receive exactly what the user said. Echo paths
+    can inspect the metadata without leaking provider failures into agent input.
+    """
+
+    fallback_from: str | None
+    provider_used: str | None
+
+    def __new__(
+        cls,
+        transcript: str,
+        *,
+        fallback_from: str | None = None,
+        provider_used: str | None = None,
+    ):
+        value = super().__new__(cls, transcript)
+        value.fallback_from = fallback_from
+        value.provider_used = provider_used
+        return value
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -18330,8 +18354,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _format_stt_echo(transcript: str) -> str:
-        """Format a transcript echo once, preserving enriched fallback notices."""
-        return transcript if transcript.startswith("🎙️") else f'🎙️ "{transcript}"'
+        """Format a transcript echo, including safe fallback metadata when present."""
+        fallback_from = getattr(transcript, "fallback_from", None)
+        if fallback_from:
+            provider_used = getattr(transcript, "provider_used", None) or "local"
+            return (
+                f'🎙️ "{transcript}"\n\n'
+                f"⚠️ STT fallback: {fallback_from} failed, so Hermes used "
+                f"{provider_used} / faster-whisper."
+            )
+        return f'🎙️ "{transcript}"'
 
     async def _enrich_message_with_transcription(
         self,
@@ -18428,14 +18460,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     fallback_from = result.get("fallback_from")
                     if fallback_from:
                         provider_used = result.get("provider", "local")
-                        # This payload is echoed to the user when transcript
-                        # echoing is enabled. Do not put the raw command error
-                        # in the echo or the LLM-visible prompt: it can contain
-                        # environment-specific details.
                         successful_transcripts.append(
-                            f'🎙️ "{transcript}"\n\n'
-                            f'⚠️ STT fallback: {fallback_from} failed, so Hermes used '
-                            f'{provider_used} / faster-whisper.'
+                            _STTTranscript(
+                                transcript,
+                                fallback_from=fallback_from,
+                                provider_used=provider_used,
+                            )
                         )
                     else:
                         successful_transcripts.append(transcript)
