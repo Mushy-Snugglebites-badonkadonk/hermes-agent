@@ -574,9 +574,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         chat_guid = self._value(record.get("chatGuid"), payload.get("chatGuid"), record.get("chat_guid"),
                                 payload.get("chat_guid"), payload.get("guid"))
         # BlueBubbles v1.9+ payloads omit top-level chatGuid; it's nested under data.chats[0].guid.
-        _chats = record.get("chats") or []
-        if not chat_guid and _chats and isinstance(_chats[0], dict):
-            chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
+        _chats = record.get("chats")
+        if not chat_guid and isinstance(_chats, list):
+            first_chat = next((chat for chat in _chats if isinstance(chat, dict)), None)
+            if first_chat:
+                chat_guid = self._value(first_chat.get("guid"), first_chat.get("chatGuid"))
         chat_identifier = self._value(record.get("chatIdentifier"), record.get("identifier"),
                                       payload.get("chatIdentifier"), payload.get("identifier"))
         handle = record.get("handle")
