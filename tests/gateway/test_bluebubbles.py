@@ -127,7 +127,8 @@ class TestBlueBubblesMentionGating:
             "type": "new-message",
             "data": {
                 "guid": "group-tapback-1",
-                "text": "Liked “Smoke test passed”",
+                "text": "Smoke test passed",
+                "associatedMessageType": 2001,
                 "handle": {"address": "+155****0100"},
                 "isFromMe": False,
                 "isGroup": True,
@@ -138,8 +139,33 @@ class TestBlueBubblesMentionGating:
 
         assert response.status == 200
         assert [event.text for event in handled] == [
-            "Reaction: User liked this message: Smoke test passed"
+            "Reaction: User added a like Tapback to: Smoke test passed"
         ]
+
+    @pytest.mark.asyncio
+    async def test_group_text_lookalike_without_tapback_metadata_remains_gated(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, require_mention=True, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "group-lookalike-1",
+                "text": "Liked “Smoke test passed”",
+                "handle": {"address": "+155****0100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "iMessage;+;group-chat"}],
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -264,6 +290,48 @@ class TestBlueBubblesUpdatedMessageHandling:
         assert handled[0].text == "Message edited.\nNew text: corrected text"
 
     @pytest.mark.asyncio
+    async def test_rejected_profile_route_does_not_poison_valid_update_retry(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+        route_attempts = 0
+        original_build_source = adapter.build_source
+
+        def reject_first_route(**kwargs):
+            nonlocal route_attempts
+            route_attempts += 1
+            source = original_build_source(**kwargs)
+            source.profile_route_rejected = route_attempts == 1
+            return source
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "build_source", reject_first_route)
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "updated-message",
+            "data": {
+                "guid": "MSG-GUID-ROUTE-RETRY",
+                "text": "corrected text",
+                "isFromMe": False,
+                "dateEdited": 123456789,
+                "handle": {"address": "user@example.com"},
+                "chats": [{"guid": "any;-;user@example.com"}],
+            },
+        }
+
+        rejected = await self._dispatch(adapter, payload)
+        assert rejected.status == 200
+        assert handled == []
+        assert not adapter._recent_update_event_keys
+        assert not adapter._recent_message_texts
+
+        accepted = await self._dispatch(adapter, payload)
+        assert accepted.status == 200
+        assert len(handled) == 1
+        assert handled[0].text == "Message edited.\nNew text: corrected text"
+
+    @pytest.mark.asyncio
     async def test_concurrent_update_retry_is_reserved_before_attachment_download(
         self, monkeypatch
     ):
@@ -275,7 +343,7 @@ class TestBlueBubblesUpdatedMessageHandling:
 
         async def slow_download(att_guid, attachment):
             await asyncio.sleep(0.01)
-            return "/tmp/update-image.png"
+            return "update-image.png"
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
         download_attachment = AsyncMock(side_effect=slow_download)
@@ -318,7 +386,7 @@ class TestBlueBubblesUpdatedMessageHandling:
             handled.append(event)
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
-        download_attachment = AsyncMock(return_value="/tmp/duplicate-sensitive-media.png")
+        download_attachment = AsyncMock(return_value="unused-media.png")
         monkeypatch.setattr(adapter, "_download_attachment", download_attachment)
 
         response = await self._dispatch(
@@ -491,7 +559,7 @@ class TestBlueBubblesUpdatedMessageHandling:
         assert "remove this" in handled[1].text
 
     @pytest.mark.asyncio
-    async def test_tapback_text_is_forwarded_as_reaction_event(self, monkeypatch):
+    async def test_associated_tapback_is_forwarded_as_reaction_event(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         handled = []
 
@@ -506,7 +574,8 @@ class TestBlueBubblesUpdatedMessageHandling:
             "type": "new-message",
             "data": {
                 "guid": "TAPBACK-GUID-1",
-                "text": "Liked “Smoke test passed”",
+                "text": "Smoke test passed",
+                "associatedMessageType": 2001,
                 "handle": {"address": "user@example.com"},
                 "isFromMe": False,
                 "chats": [{"guid": "any;-;user@example.com"}],
@@ -516,7 +585,7 @@ class TestBlueBubblesUpdatedMessageHandling:
         await self._dispatch(adapter, tapback)
 
         assert len(handled) == 1
-        assert handled[0].text == "Reaction: User liked this message: Smoke test passed"
+        assert handled[0].text == "Reaction: User added a like Tapback to: Smoke test passed"
         assert handled[0].source.chat_id == "user@example.com"
         mark_read.assert_awaited_once_with("user@example.com")
 
@@ -537,7 +606,8 @@ class TestBlueBubblesUpdatedMessageHandling:
             "type": "new-message",
             "data": {
                 "guid": "TAPBACK-ALIAS",
-                "text": "Liked “Alias-safe”",
+                "text": "Alias-safe",
+                "associatedMessageType": 2001,
                 "chatIdentifier": "user@example.com",
                 "isFromMe": False,
             },
@@ -554,10 +624,10 @@ class TestBlueBubblesUpdatedMessageHandling:
         await self._dispatch(adapter, handle_retry)
 
         assert len(handled) == 1
-        assert handled[0].text == "Reaction: User liked this message: Alias-safe"
+        assert handled[0].text == "Reaction: User added a like Tapback to: Alias-safe"
 
     @pytest.mark.asyncio
-    async def test_removed_tapback_text_is_forwarded_as_reaction_removal(self, monkeypatch):
+    async def test_associated_tapback_removal_is_forwarded(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         handled = []
 
@@ -576,7 +646,8 @@ class TestBlueBubblesUpdatedMessageHandling:
                 "type": "new-message",
                 "data": {
                     "guid": "TAPBACK-GUID-2",
-                    "text": "Removed a like from “Smoke test passed”",
+                    "text": "Smoke test passed",
+                    "associatedMessageType": 3001,
                     "handle": {"address": "user@example.com"},
                     "isFromMe": False,
                     "chats": [{"guid": "any;-;user@example.com"}],
@@ -816,7 +887,7 @@ class TestBlueBubblesAttachmentDownload:
 
         async def mock_cache_image(data, ext):
             nonlocal cached_path
-            cached_path = f"/tmp/test_image{ext}"
+            cached_path = f"test_image{ext}"
             return cached_path
 
         monkeypatch.setattr(
@@ -828,7 +899,7 @@ class TestBlueBubblesAttachmentDownload:
         result = asyncio.get_event_loop().run_until_complete(
             adapter._download_attachment("att-guid-123", att_meta)
         )
-        assert result == "/tmp/test_image.png"
+        assert result == "test_image.png"
 
 
 class TestBlueBubblesAttachmentSend:
@@ -1123,7 +1194,7 @@ class TestBlueBubblesGateBeforeDownload:
         async def fake_handle_message(event):
             handled.append(event)
 
-        download = AsyncMock(return_value="/tmp/cached.jpg")
+        download = AsyncMock(return_value="cached.jpg")
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
         monkeypatch.setattr(adapter, "_download_attachment", download)
         response = await adapter._handle_webhook(_FakeBlueBubblesRequest({

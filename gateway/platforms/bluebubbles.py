@@ -62,16 +62,6 @@ _TAPBACK_REMOVED = {
     3000: "love", 3001: "like", 3002: "dislike",
     3003: "laugh", 3004: "emphasize", 3005: "question",
 }
-_TAPBACK_TEXT_RE = re.compile(
-    r'^(?P<verb>Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+["“](?P<target>.*)["”]$', re.S,
-)
-_TAPBACK_REMOVED_TEXT_RE = re.compile(
-    r'^Removed an? (?P<reaction>like|love|dislike|laugh|emphasis|question) from\s+["“](?P<target>.*)["”]$', re.S,
-)
-_TAPBACK_VERBS = {
-    "Liked": "liked", "Loved": "loved", "Disliked": "disliked",
-    "Laughed at": "laughed at", "Emphasized": "emphasized", "Questioned": "questioned",
-}
 _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
 _UPDATED_MESSAGE_CACHE_LIMIT = 500
 
@@ -624,21 +614,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 or self._canonical_dm_handle(chat_guid)
                 or chat_guid or chat_identifier or sender or "")
 
-    @staticmethod
-    def _classify_tapback_text(text: str) -> Optional[str]:
-        stripped = text.strip()
-        removed = _TAPBACK_REMOVED_TEXT_RE.match(stripped)
-        if removed:
-            reaction = removed.group("reaction")
-            target = removed.group("target").strip()
-            return f"Reaction removed: User removed a {reaction} Tapback from: {target}"
-        match = _TAPBACK_TEXT_RE.match(stripped)
-        if not match:
-            return None
-        verb = _TAPBACK_VERBS[match.group("verb")]
-        target = match.group("target").strip()
-        return f"Reaction: User {verb} this message: {target}"
-
     def _classify_tapback_record(self, record: Dict[str, Any], text: str) -> Optional[str]:
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, str) and assoc_type.strip().lstrip("-").isdigit():
@@ -650,7 +625,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if assoc_type in _TAPBACK_REMOVED:
                 reaction = _TAPBACK_REMOVED[assoc_type]
                 return f"Reaction removed: User removed a {reaction} Tapback from: {text or '(message text unavailable)'}"
-        return self._classify_tapback_text(text)
+        # Text resembling a Tapback is not authoritative: an ordinary group
+        # message can say `Liked “…”`. Only BlueBubbles' associated-message code
+        # classifies a reaction and permits it to bypass mention gating.
+        return None
 
     def _classify_updated_message(self, record: Dict[str, Any], message_id: Optional[str],
                                   text: str) -> Optional[str]:
@@ -730,6 +708,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not sender or not session_chat_id:
             return web.json_response({"error": "missing message fields"}, status=400)
 
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name=chat_identifier or sender,
+            chat_type="group" if is_group else "dm",
+            user_id=sender,
+            user_name=sender,
+            chat_id_alt=chat_guid if chat_guid != session_chat_id else chat_identifier,
+        )
+        # Profile-route rejection is recorded on SessionSource by build_source;
+        # consume it before caches or attachment downloads can be changed.
+        if self._drop_unresolved(MessageEvent(text=text, message_type=MessageType.TEXT,
+                                             source=source, raw_message=payload)):
+            return _ok()
+
         tapback_text = self._classify_tapback_record(record, text)
         is_tapback = tapback_text is not None
         message_id = self._message_id_for_record(record)
@@ -772,14 +764,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not text:
             return web.json_response({"error": "missing message fields"}, status=400)
 
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=chat_identifier or sender,
-            chat_type="group" if is_group else "dm",
-            user_id=sender,
-            user_name=sender,
-            chat_id_alt=chat_guid if chat_guid != session_chat_id else chat_identifier,
-        )
         event = MessageEvent(
             text=text,
             message_type=msg_type,
